@@ -1,0 +1,29 @@
+stages:
+  - lint
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  RUSTFLAGS: -D warnings
+
+default:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry
+      - target
+
+.rust:
+  image: rust:latest
+  before_script:
+    - rustc --version && cargo --version
+
+lint:
+  extends: .rust
+  stage: lint
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets --features rquickjs-debugger/server

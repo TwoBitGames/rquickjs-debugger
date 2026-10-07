@@ -25,3 +25,5 @@ include!("inlines/ptr_64.rs");
 include!("inlines/ptr_32_nan_boxing.rs");
 
 include!("inlines/common.rs");
+mod debugger;
+pub use debugger::*;

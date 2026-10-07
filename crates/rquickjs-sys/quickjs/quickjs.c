@@ -45,6 +45,7 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+#include "quickjs-debugger.h"
 #include "libregexp.h"
 #include "dtoa.h"
 
@@ -334,6 +335,28 @@ typedef struct JSClass {
     const JSClassExoticMethods *exotic;
 } JSClass;
 
+typedef struct JSDebuggerBreakpoint {
+    JSAtom filename;
+    int line;
+} JSDebuggerBreakpoint;
+
+typedef struct JSDebugger {
+    JSDebuggerPauseHandler *handler;
+    void *opaque;
+    JSDebuggerBreakpoint *breakpoints;
+    int breakpoint_count, breakpoint_capacity;
+    uint32_t generation;
+    bool breakpoints_active;
+    bool pause_requested;
+    bool pause_on_exceptions;
+    bool suspended;
+    int step_mode;
+    struct JSStackFrame *step_frame;
+    int step_depth, step_line;
+    JSAtom step_file;
+    struct JSStackFrame *paused_frame;
+    JSValue last_exception;
+} JSDebugger;
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -382,6 +405,7 @@ struct JSRuntime {
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
+    JSDebugger debugger;
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
     // for smuggling the parent promise from js_promise_then
@@ -888,6 +912,8 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    uint8_t *debugger_flags;
+    uint32_t debugger_generation;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -1470,6 +1496,11 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
 static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
                                const char *filename, int line, int flags, int scope_idx);
+static void js_debugger_free(JSRuntime *rt);
+static no_inline void js_debugger_check(JSContext *ctx, JSStackFrame *sf,
+                                        JSFunctionBytecode *b, uint8_t *pc);
+static no_inline void js_debugger_exception(JSContext *ctx, JSStackFrame *sf,
+                                            JSFunctionBytecode *b, uint8_t *pc);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
                                       JSValueConst attr2);
@@ -2649,6 +2680,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+    js_debugger_free(rt);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -8122,6 +8154,7 @@ fail:
     return b->line_num;
 }
 
+#include "quickjs-debugger.c"
 /* in order to avoid executing arbitrary code during the stack trace
    generation, we only look at simple 'name' properties containing a
    string. */
@@ -18053,8 +18086,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+#define JS_DEBUGGER_CHECK(pc) \
+    if (unlikely(rt->debugger.handler)) js_debugger_check(ctx, sf, b, pc);
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) JS_DEBUGGER_CHECK(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -18065,7 +18100,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) JS_DEBUGGER_CHECK(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -20898,6 +20933,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
+    if (unlikely(rt->debugger.handler) && rt->debugger.pause_on_exceptions)
+        js_debugger_exception(ctx, sf, b, pc);
     if (!JS_IsUncatchableError(rt->current_exception)) {
         while (sp > stack_buf) {
             JSValue val = *--sp;
@@ -29408,6 +29445,28 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
+    switch (s->token.val) {
+    case TOK_VAR:
+    case TOK_LET:
+    case TOK_CONST:
+    case TOK_RETURN:
+    case TOK_IF:
+    case TOK_FOR:
+    case TOK_WHILE:
+    case TOK_DO:
+    case TOK_SWITCH:
+    case TOK_TRY:
+    case TOK_BREAK:
+    case TOK_CONTINUE:
+    case TOK_WITH:
+    case TOK_DEBUGGER:
+        emit_source_loc(s);
+        break;
+    default:
+        if (token_is_pseudo_keyword(s, JS_ATOM_let))
+            emit_source_loc(s);
+        break;
+    }
     switch(tok = s->token.val) {
     case '{':
         if (js_parse_block(s))
@@ -37159,6 +37218,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+    js_free_rt(rt, b->debugger_flags);
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(b) != 0) {

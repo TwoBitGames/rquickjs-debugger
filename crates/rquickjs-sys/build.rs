@@ -36,7 +36,9 @@ fn download_wasi_sdk() -> PathBuf {
             other => panic!("Unsupported platform tuple {:?}", other),
         };
 
-        let uri = format!("https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{major_version}/wasi-sdk-{major_version}.{minor_version}-{file_suffix}.tar.gz");
+        let uri = format!(
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{major_version}/wasi-sdk-{major_version}.{minor_version}-{file_suffix}.tar.gz"
+        );
 
         println!("Downloading WASI SDK archive from {uri} to {archive_path:?}");
 
@@ -117,6 +119,9 @@ fn main() {
         println!("cargo:rerun-if-env-changed={}", feature_to_cargo(feature));
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
+    println!("cargo:rerun-if-changed=quickjs");
+    println!("cargo:rerun-if-changed=quickjs.bind.h");
+    println!("cargo:rerun-if-changed=build.rs");
 
     let src_dir = Path::new("quickjs");
 
@@ -138,6 +143,8 @@ fn main() {
         "quickjs-opcode.h",
         "quickjs-c-atomics.h",
         "quickjs.h",
+        "quickjs-debugger.h",
+        "quickjs-debugger.c",
     ];
 
     let source_files = ["libregexp.c", "libunicode.c", "quickjs.c", "dtoa.c"];
