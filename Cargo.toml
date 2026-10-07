@@ -5,6 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
+repository = "https://gitlab.prod.twobit-games.com/oss/rquickjs-debugger"
 rust-version = "1.85"
 
 [workspace.dependencies]
